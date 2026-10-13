@@ -736,6 +736,74 @@ def _enforce_tensor_spec(
     return values
 
 
+def _find_value_changed_by_cast(values: np.ndarray, dtype: np.dtype):
+    """
+    Return the first element of the numeric (bool, int, uint or float) array ``values`` whose
+    value would change when cast to the numeric ``dtype``, or ``None`` if the cast keeps every
+    value. Float precision loss is tolerated (e.g. 0.1 -> float32), because JSON payloads always
+    decode to int64/float64 and must stay usable with float32 models. Fractional or non-finite
+    values cast to integers, out-of-range integers, finite values that overflow to inf and
+    values other than 0/1 cast to bool are reported.
+    """
+    if values.size == 0 or np.can_cast(values.dtype, dtype, casting="safe"):
+        return None
+
+    with np.errstate(invalid="ignore", over="ignore"):
+        if dtype.kind == "f":
+            changed = np.isfinite(values) & ~np.isfinite(values.astype(dtype))
+        elif dtype.kind == "b":
+            changed = (values != 0) & (values != 1)
+        elif values.dtype.kind == "f":
+            info = np.iinfo(dtype)
+            # float(info.max) + 1 is exactly 2**(bits - 1) or 2**bits, so values that
+            # round up to the integer max are still caught.
+            changed = (
+                ~np.isfinite(values)
+                | (values != np.trunc(values))
+                | (values < info.min)
+                | (values >= float(info.max) + 1)
+            )
+        else:
+            info = np.iinfo(dtype)
+            source_info = np.iinfo(values.dtype)
+            changed = np.zeros(values.shape, dtype=bool)
+            # Only compare against bounds the source dtype can represent, which avoids
+            # mixed signed/unsigned comparisons going through float64.
+            if info.min > source_info.min:
+                changed |= values < np.asarray(info.min, dtype=values.dtype)
+            if info.max < source_info.max:
+                changed |= values > np.asarray(info.max, dtype=values.dtype)
+
+    if changed.any():
+        return values[changed][0].item()
+    return None
+
+
+def _validate_tensor_type_cast(values, dtype: np.dtype, name: str | None) -> None:
+    """
+    Raise if casting numeric ``values`` to the numeric TensorSpec ``dtype`` would alter them
+    (truncation, wraparound, overflow to inf). Non-numeric casts are left to the caller.
+    """
+    array = np.asarray(values)
+    if (
+        array.dtype != dtype
+        and array.dtype.kind in "biuf"
+        and dtype.kind in "biuf"
+        and (changed := _find_value_changed_by_cast(array, dtype)) is not None
+    ):
+        input_desc = f"input '{name}'" if name is not None else "the unnamed input"
+        raise MlflowException(
+            f"Incompatible input types for {input_desc}. Can not safely convert "
+            f"{array.dtype} to {dtype}: the value {changed!r} would change during the conversion.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+
+
+def _cast_to_tensor_type(values, dtype: np.dtype, name: str | None) -> np.ndarray:
+    _validate_tensor_type_cast(values, dtype, name)
+    return np.array(values, dtype=dtype)
+
+
 def _enforce_mlflow_datatype(name, values: pd.Series, t: DataType):
     """
     Enforce the input column type matches the declared in model input schema.
@@ -1010,7 +1078,8 @@ def _reshape_and_cast_pandas_column_values(name, pd_series, tensor_spec):
         for shape in [(-1,), (-1, 1)]:
             if tensor_spec.shape == shape:
                 return _enforce_tensor_spec(
-                    np.array(pd_series, dtype=tensor_spec.type).reshape(shape), tensor_spec
+                    _cast_to_tensor_type(pd_series, tensor_spec.type, name).reshape(shape),
+                    tensor_spec,
                 )
         raise MlflowException(
             f"The input pandas dataframe column '{name}' contains scalar "
@@ -1023,7 +1092,7 @@ def _reshape_and_cast_pandas_column_values(name, pd_series, tensor_spec):
         # in this case, the shape and type information is lost,
         # so do not enforce the shape and type, instead,
         # reshape the array value list to the required shape, and cast value type to
-        # required type.
+        # required type, rejecting casts that would change values.
         reshape_err_msg = (
             f"The value in the Input DataFrame column '{name}' could not be converted to the "
             f"expected shape of: '{tensor_spec.shape}'. Ensure that each of the input list "
@@ -1032,8 +1101,8 @@ def _reshape_and_cast_pandas_column_values(name, pd_series, tensor_spec):
         )
         try:
             flattened_numpy_arr = np.vstack(pd_series.tolist())
-            reshaped_numpy_arr = flattened_numpy_arr.reshape(tensor_spec.shape).astype(
-                tensor_spec.type
+            reshaped_numpy_arr = _cast_to_tensor_type(
+                flattened_numpy_arr.reshape(tensor_spec.shape), tensor_spec.type, name
             )
         except ValueError:
             raise MlflowException(reshape_err_msg, error_code=INVALID_PARAMETER_VALUE)
@@ -1048,14 +1117,13 @@ def _reshape_and_cast_pandas_column_values(name, pd_series, tensor_spec):
         )
         try:
             # Because numpy array includes precise type information, so we don't convert type
-            # here, so that in following schema validation we can have strict type check on
-            # numpy array column.
+            # here, so that the dtype check below is as strict as for numpy array input.
             reshaped_numpy_arr = np.vstack(pd_series.tolist()).reshape(tensor_spec.shape)
         except ValueError:
             raise MlflowException(reshape_err_msg, error_code=INVALID_PARAMETER_VALUE)
         if len(reshaped_numpy_arr) != len(pd_series):
             raise MlflowException(reshape_err_msg, error_code=INVALID_PARAMETER_VALUE)
-        return reshaped_numpy_arr
+        return _enforce_tensor_spec(reshaped_numpy_arr, tensor_spec)
     else:
         raise MlflowException(
             "Because the model signature requires tensor spec input, the input "

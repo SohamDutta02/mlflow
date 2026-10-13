@@ -543,6 +543,72 @@ def test_tensor_schema_enforcement_dataframe_row_index(named, index, values, sha
     pd.testing.assert_frame_equal(df, original)
 
 
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize(
+    ("values", "dtype", "shape", "error"),
+    [
+        ([1.7, -2.9, 3.5], "int64", (-1,), "float64 to int64: the value 1.7 would change"),
+        ([1.0, np.nan], "int64", (-1, 1), "Can not safely convert float64 to int64: the value nan"),
+        ([2.0**63], "int64", (-1,), "float64 to int64: the value 9.223372036854776e+18"),
+        ([2**31, 2**40 + 7], "int32", (-1,), "int64 to int32: the value 2147483648"),
+        ([-1, 2], "uint64", (-1,), "Can not safely convert int64 to uint64: the value -1"),
+        ([2**63], "int64", (-1,), "uint64 to int64: the value 9223372036854775808"),
+        ([1e300], "float32", (-1,), "Can not safely convert float64 to float32: the value 1e+300"),
+        ([70000], "float16", (-1,), "Can not safely convert int64 to float16: the value 70000"),
+        ([0, 5, -3], "bool", (-1,), "Can not safely convert int64 to bool: the value 5"),
+        ([[2**31, 1], [3, 4]], "int32", (-1, 2), "int64 to int32: the value 2147483648"),
+        ([[0.5, 1.0], [3.0, 4.0]], "int32", (-1, 2), "float64 to int32: the value 0.5"),
+        (
+            [np.array([1.5, 2.0]), np.array([3.0, 4.0])],
+            "int32",
+            (-1, 2),
+            "dtype of input float64 does not match expected dtype int32",
+        ),
+    ],
+)
+def test_tensor_schema_enforcement_dataframe_rejects_value_changing_casts(
+    named, values, dtype, shape, error
+):
+    model = Model()
+    model.signature = ModelSignature(
+        inputs=Schema([TensorSpec(np.dtype(dtype), shape, "x" if named else None)])
+    )
+    pyfunc_model = PyFuncModel(model_meta=model, model_impl=TestModel())
+
+    with pytest.raises(MlflowException, match=re.escape(error)):
+        pyfunc_model.predict(pd.DataFrame({"x": values}))
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize(
+    ("values", "dtype", "shape"),
+    [
+        ([0.1, 2.5], "float32", (-1,)),
+        ([1, 2], "float32", (-1, 1)),
+        ([1, -2], "int32", (-1,)),
+        ([1.0, -2.0], "int64", (-1,)),
+        ([0, 1], "bool", (-1,)),
+        ([True, False], "int8", (-1,)),
+        ([[0.1, 1], [3, 4.5]], "float32", (-1, 2)),
+        ([[1, 2], [3, 255]], "uint8", (-1, 2)),
+    ],
+)
+def test_tensor_schema_enforcement_dataframe_allows_value_preserving_casts(
+    named, values, dtype, shape
+):
+    model = Model()
+    model.signature = ModelSignature(
+        inputs=Schema([TensorSpec(np.dtype(dtype), shape, "x" if named else None)])
+    )
+    pyfunc_model = PyFuncModel(model_meta=model, model_impl=TestModel())
+
+    result = pyfunc_model.predict(pd.DataFrame({"x": values}))
+    if named:
+        result = result["x"]
+    assert result.dtype == np.dtype(dtype)
+    np.testing.assert_array_equal(result, np.array(values, dtype=dtype).reshape(shape))
+
+
 def test_schema_enforcement_named_tensor_schema_1d():
     m = Model()
     input_schema = Schema([

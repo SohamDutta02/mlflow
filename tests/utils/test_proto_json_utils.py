@@ -611,6 +611,16 @@ def test_datetime_encoder(dt, expected):
             Schema([ColSpec("double", "foo")]),
             np.dtype("float64"),
         ),
+        (
+            pd.DataFrame(columns=["foo"], data=[0.1, 1e30]),
+            Schema([TensorSpec(np.dtype("float32"), [-1], "foo")]),
+            np.dtype("float32"),
+        ),
+        (
+            pd.DataFrame(columns=["foo"], data=[1, -(2**31)]),
+            Schema([TensorSpec(np.dtype("int32"), [-1], "foo")]),
+            np.dtype("int32"),
+        ),
     ],
 )
 def test_cast_df_types_according_to_schema_success(dataframe, schema, expected):
@@ -630,6 +640,16 @@ def test_cast_df_types_according_to_schema_success(dataframe, schema, expected):
             pd.DataFrame(columns=["foo"], data=["a", "b", "c"]),
             Schema([ColSpec("double", "foo")]),
             r'ValueError\("could not convert string to float: \'a\'"\)',
+        ),
+        (
+            pd.DataFrame(columns=["foo"], data=[1, 2**31]),
+            Schema([TensorSpec(np.dtype("int32"), [-1], "foo")]),
+            r"Can not safely convert int64 to int32: the value 2147483648 would change",
+        ),
+        (
+            pd.DataFrame(columns=["foo"], data=[1.7]),
+            Schema([TensorSpec(np.dtype("int64"), [-1])]),
+            r"Can not safely convert float64 to int64: the value 1.7 would change",
         ),
     ],
 )

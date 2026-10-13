@@ -277,7 +277,12 @@ def cast_df_types_according_to_schema(pdf, schema):
     import numpy as np
     import pandas as pd
 
-    from mlflow.models.utils import _enforce_array, _enforce_map, _enforce_object
+    from mlflow.models.utils import (
+        _enforce_array,
+        _enforce_map,
+        _enforce_object,
+        _validate_tensor_type_cast,
+    )
     from mlflow.types.schema import AnyType, Array, DataType, Map, Object
 
     actual_cols = set(pdf.columns)
@@ -345,6 +350,8 @@ def cast_df_types_according_to_schema(pdf, schema):
                         or (isinstance(col_type, np.dtype) and col_type.kind == "U")
                     ) and isinstance(pdf[col_name].dtype, pd.StringDtype):
                         continue
+                    if schema.is_tensor_spec():
+                        _validate_tensor_type_cast(pdf[col_name], col_type, col_name)
                     pdf[col_name] = pdf[col_name].astype(col_type)
             except Exception as ex:
                 raise MlflowFailedTypeConversion(col_name, col_type, ex)
